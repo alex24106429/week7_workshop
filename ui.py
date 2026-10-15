@@ -1,310 +1,238 @@
-import sys
-import importlib.util
-from unittest.mock import MagicMock
-import torch
-
-# Fix for remote code flash-attn bug
-class FakeFlashAttnSpec:
-    name = 'flash_attn'
-    loader = None
-    origin = None
-    submodule_search_locations = []
-    
-fake_spec = FakeFlashAttnSpec()
-flash_attn_mock = MagicMock()
-flash_attn_mock.__spec__ = fake_spec
-flash_attn_mock.__version__ = "0.0.0"
-
-sys.modules['flash_attn'] = flash_attn_mock
-sys.modules['flash_attn.flash_attn_interface'] = MagicMock()
-sys.modules['flash_attn.bert_padding'] = MagicMock()
-
-_original_find_spec = importlib.util.find_spec
-def _patched_find_spec(name, package=None):
-    if name == 'flash_attn' or name.startswith('flash_attn.'):
-        return fake_spec
-    return _original_find_spec(name, package)
-importlib.util.find_spec = _patched_find_spec
-
-# --- Imports ---
+import os
+import cv2
+import tempfile
 import gradio as gr
-from transformers import AutoProcessor, AutoModelForCausalLM
-import copy
-from PIL import Image, ImageDraw
-import random
 import numpy as np
+import torch
+import matplotlib
+import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw
+from typing import Iterable
 
-# --- Device & Dtype Setup ---
-if hasattr(torch, "xpu") and torch.xpu.is_available():
-    device = torch.device("xpu")
-    dtype = torch.float16
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-    dtype = torch.float16
-else:
-    device = torch.device("cpu")
-    dtype = torch.bfloat16
-
-print(f"Running inference on: {device} with dtype: {dtype}")
-
-MODEL_ID = 'microsoft/Florence-2-large'
-REVISION = '00d2f1570b00c6dea5df998f5635db96840436bc'
-
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    torch_dtype=dtype,
-    trust_remote_code=True,
-    attn_implementation="sdpa",
-    revision=REVISION
-).to(device).eval()
-
-processor = AutoProcessor.from_pretrained(
-    MODEL_ID,
-    revision=REVISION,
-    trust_remote_code=True
+from transformers import (
+    Sam3Model, Sam3Processor,
+    Sam3TrackerModel, Sam3TrackerProcessor
 )
 
-colormap = ['blue','orange','green','purple','brown','pink','gray','olive','cyan','red',
-            'lime','indigo','violet','aqua','magenta','coral','gold','tan','skyblue']
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🖥️ Using compute device: {device}")
 
-def run_example(task_prompt, image, text_input=None):
-    prompt = task_prompt if text_input is None else task_prompt + text_input
-    inputs = processor(text=prompt, images=image, return_tensors="pt")
-    
-    inputs = {
-        k: v.to(device=device, dtype=dtype) if v.is_floating_point() else v.to(device=device)
-        for k, v in inputs.items()
-    }
-    
-    with torch.inference_mode():
-        generated_ids = model.generate(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs["pixel_values"],
-            max_new_tokens=1024,
-            early_stopping=False,
-            do_sample=False,
-            num_beams=1,
-        )
+print("⏳ Loading SAM3 Models permanently into memory...")
 
-    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-    parsed_answer = processor.post_process_generation(
-        generated_text,
-        task=task_prompt,
-        image_size=(image.width, image.height)
-    )
-    return parsed_answer
+try:
+    # 1. Load Image Segmentation Model (Text)
+    print("   ... Loading Image Text Model")
+    IMG_MODEL = Sam3Model.from_pretrained("bodhicitta/sam3").to(device)
+    IMG_PROCESSOR = Sam3Processor.from_pretrained("bodhicitta/sam3")
 
-# Converts pixel bbox to Florence-2 <loc_x1><loc_y1><loc_x2><loc_y2> tokens
-def bbox_to_loc_tokens(bbox, width, height):
-    x1, y1, x2, y2 = bbox
-    xmin, xmax = min(x1, x2), max(x1, x2)
-    ymin, ymax = min(y1, y2), max(y1, y2)
+    # 2. Load Image Tracker Model (Click)
+    print("   ... Loading Image Tracker Model")
+    TRK_MODEL = Sam3TrackerModel.from_pretrained("bodhicitta/sam3").to(device)
+    TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained("bodhicitta/sam3")
+
+    print("✅ All Models loaded successfully!")
+
+except Exception as e:
+    print(f"❌ CRITICAL ERROR LOADING MODELS: {e}")
+    IMG_MODEL = None
+    IMG_PROCESSOR = None
+    TRK_MODEL = None
+    TRK_PROCESSOR = None
+    VID_MODEL = None
+    VID_PROCESSOR = None
+
+
+# --- UTILS ---
+def apply_mask_overlay(base_image, mask_data, opacity=0.5):
+    """Draws segmentation masks on top of an image."""
+    if isinstance(base_image, np.ndarray):
+        base_image = Image.fromarray(base_image)
+    base_image = base_image.convert("RGBA")
     
-    # Florence-2 uses 1000 coordinate bins [0, 999]
-    loc_x1 = int(np.clip(np.floor(xmin * 1000.0 / width), 0, 999))
-    loc_y1 = int(np.clip(np.floor(ymin * 1000.0 / height), 0, 999))
-    loc_x2 = int(np.clip(np.floor(xmax * 1000.0 / width), 0, 999))
-    loc_y2 = int(np.clip(np.floor(ymax * 1000.0 / height), 0, 999))
-    
-    # Avoid degenerate zero-area bounding boxes
-    if loc_x2 <= loc_x1:
-        loc_x2 = min(loc_x1 + 1, 999)
-    if loc_y2 <= loc_y1:
-        loc_y2 = min(loc_y1 + 1, 999)
+    if mask_data is None or len(mask_data) == 0:
+        return base_image.convert("RGB")
         
-    return f"<loc_{loc_x1}><loc_{loc_y1}><loc_{loc_x2}><loc_{loc_y2}>"
-
-def plot_bbox(image, data):
-    output_image = image.copy()
-    draw = ImageDraw.Draw(output_image)
-    for bbox, label in zip(data.get('bboxes', []), data.get('labels', [])):
-        x1, y1, x2, y2 = bbox
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-        draw.text((x1 + 4, y1 + 2), str(label), fill="red")
-    return output_image
-
-def draw_polygons(image, prediction, fill_mask=False):
-    draw = ImageDraw.Draw(image)
-    scale = 1
-    for polygons, label in zip(prediction.get('polygons', []), prediction.get('labels', [])):
-        color = random.choice(colormap)
-        fill_color = color if fill_mask else None
-        for _polygon in polygons:
-            _polygon = np.array(_polygon).reshape(-1, 2)
-            if len(_polygon) < 3:
-                continue
-            _polygon = (_polygon * scale).reshape(-1).tolist()
-            if fill_mask:
-                draw.polygon(_polygon, outline=color, fill=fill_color)
-            else:
-                draw.polygon(_polygon, outline=color)
-            draw.text((_polygon[0] + 8, _polygon[1] + 2), str(label), fill=color)
-    return image
-
-def convert_to_od_format(data):
-    return {
-        'bboxes': data.get('bboxes', []),
-        'labels': data.get('bboxes_labels', data.get('labels', []))
-    }
-
-def draw_ocr_bboxes(image, prediction):
-    draw = ImageDraw.Draw(image)
-    bboxes, labels = prediction['quad_boxes'], prediction['labels']
-    for box, label in zip(bboxes, labels):
-        color = random.choice(colormap)
-        new_box = (np.array(box)).tolist()
-        draw.polygon(new_box, width=3, outline=color)
-        draw.text((new_box[0] + 8, new_box[1] + 2), str(label), fill=color)
-    return image
-
-# --- Cascaded Multi-Object Segmentation ---
-def run_ovd_to_segmentation(image, text_input=None):
-    if not text_input or not text_input.strip():
-        # Fallback to standard object detection if no text input provided
-        detection_task = '<OD>'
-        det_results = run_example(detection_task, image)
-        bboxes = det_results[detection_task].get('bboxes', [])
-        labels = det_results[detection_task].get('labels', [])
-    else:
-        detection_task = '<OPEN_VOCABULARY_DETECTION>'
-        det_results = run_example(detection_task, image, text_input)
-        det_data = det_results.get(detection_task, {})
-        bboxes = det_data.get('bboxes', [])
-        labels = det_data.get('bboxes_labels', det_data.get('labels', []))
-
-    if not bboxes:
-        return {"message": "No objects detected"}, image
-
-    if len(labels) < len(bboxes):
-        labels += [text_input if text_input else "object"] * (len(bboxes) - len(labels))
-
-    all_polygons = []
-    all_labels = []
-
-    # Segment every detected bounding box individually
-    for bbox, label in zip(bboxes, labels):
-        loc_tokens = bbox_to_loc_tokens(bbox, image.width, image.height)
-        seg_res = run_example('<REGION_TO_SEGMENTATION>', image, loc_tokens)
-        seg_data = seg_res.get('<REGION_TO_SEGMENTATION>', {})
-        polygons = seg_data.get('polygons', [])
-        
-        for poly in polygons:
-            all_polygons.append(poly)
-            all_labels.append(label)
-
-    combined_results = {
-        'detections': {
-            'bboxes': bboxes,
-            'labels': labels
-        },
-        '<REGION_TO_SEGMENTATION>': {
-            'polygons': all_polygons,
-            'labels': all_labels
-        }
-    }
-
-    output_image = copy.deepcopy(image)
-    if all_polygons:
-        output_image = draw_polygons(output_image, combined_results['<REGION_TO_SEGMENTATION>'], fill_mask=True)
-
-    return combined_results, output_image
-
-def process_image(image, task_prompt, text_input=None):
-    image = Image.fromarray(image)
+    if isinstance(mask_data, torch.Tensor):
+        mask_data = mask_data.cpu().numpy()
+    mask_data = mask_data.astype(np.uint8)
     
-    if task_prompt in ['Caption', 'Detailed Caption', 'More Detailed Caption', 'Region to Category', 'Region to Description', 'OCR']:
-        tag_map = {
-            'Caption': '<CAPTION>',
-            'Detailed Caption': '<DETAILED_CAPTION>',
-            'More Detailed Caption': '<MORE_DETAILED_CAPTION>',
-            'Region to Category': '<REGION_TO_CATEGORY>',
-            'Region to Description': '<REGION_TO_DESCRIPTION>',
-            'OCR': '<OCR>'
-        }
-        tag = tag_map[task_prompt]
-        return run_example(tag, image, text_input), None
+    # Handle dimensions
+    if mask_data.ndim == 4: mask_data = mask_data[0] 
+    if mask_data.ndim == 3 and mask_data.shape[0] == 1: mask_data = mask_data[0]
+    
+    num_masks = mask_data.shape[0] if mask_data.ndim == 3 else 1
+    if mask_data.ndim == 2:
+        mask_data = [mask_data]
+        num_masks = 1
 
-    elif task_prompt in ['Caption + Grounding', 'Detailed Caption + Grounding', 'More Detailed Caption + Grounding']:
-        tag_map = {
-            'Caption + Grounding': '<CAPTION>',
-            'Detailed Caption + Grounding': '<DETAILED_CAPTION>',
-            'More Detailed Caption + Grounding': '<MORE_DETAILED_CAPTION>'
-        }
-        base_tag = tag_map[task_prompt]
-        results = run_example(base_tag, image)
-        text_grounding = results[base_tag]
-        ground_results = run_example('<CAPTION_TO_PHRASE_GROUNDING>', image, text_grounding)
-        ground_results[base_tag] = text_grounding
-        img_out = plot_bbox(image, ground_results['<CAPTION_TO_PHRASE_GROUNDING>'])
-        return ground_results, img_out
+    try:
+        color_map = matplotlib.colormaps["rainbow"].resampled(max(num_masks, 1))
+    except AttributeError:
+        import matplotlib.cm as cm
+        color_map = cm.get_cmap("rainbow").resampled(max(num_masks, 1))
+        
+    rgb_colors = [tuple(int(c * 255) for c in color_map(i)[:3]) for i in range(num_masks)]
+    composite_layer = Image.new("RGBA", base_image.size, (0, 0, 0, 0))
+    
+    for i, single_mask in enumerate(mask_data):
+        mask_bitmap = Image.fromarray((single_mask * 255).astype(np.uint8))
+        if mask_bitmap.size != base_image.size:
+            mask_bitmap = mask_bitmap.resize(base_image.size, resample=Image.NEAREST)
+        
+        fill_color = rgb_colors[i]
+        color_fill = Image.new("RGBA", base_image.size, fill_color + (0,))
+        mask_alpha = mask_bitmap.point(lambda v: int(v * opacity) if v > 0 else 0)
+        color_fill.putalpha(mask_alpha)
+        composite_layer = Image.alpha_composite(composite_layer, color_fill)
+        
+    return Image.alpha_composite(base_image, composite_layer).convert("RGB")
 
-    elif task_prompt in ['Object Detection', 'Dense Region Caption', 'Region Proposal', 'Caption to Phrase Grounding']:
-        tag_map = {
-            'Object Detection': '<OD>',
-            'Dense Region Caption': '<DENSE_REGION_CAPTION>',
-            'Region Proposal': '<REGION_PROPOSAL>',
-            'Caption to Phrase Grounding': '<CAPTION_TO_PHRASE_GROUNDING>'
-        }
-        tag = tag_map[task_prompt]
-        results = run_example(tag, image, text_input)
-        img_out = plot_bbox(image, results[tag])
-        return results, img_out
+def draw_points_on_image(image, points):
+    """Draws red dots on the image to indicate click locations."""
+    if isinstance(image, np.ndarray):
+        image = Image.fromarray(image)
+    
+    draw_img = image.copy()
+    draw = ImageDraw.Draw(draw_img)
+    
+    for pt in points:
+        x, y = pt
+        r = 8 # Radius of point
+        draw.ellipse((x-r, y-r, x+r, y+r), fill="red", outline="white", width=4)
+    
+    return draw_img
 
-    # Cascaded multi-object segmentation
-    elif task_prompt in ['Open Vocabulary Detection + Segmentation']:
-        return run_ovd_to_segmentation(image, text_input)
+def run_image_segmentation(source_img, text_query, conf_thresh=0.5):
+    if IMG_MODEL is None or IMG_PROCESSOR is None:
+        raise gr.Error("Models failed to load on startup.")
+        
+    if source_img is None or not text_query:
+        raise gr.Error("Please provide an image and a text prompt.")
+    
+    try:
+        pil_image = source_img.convert("RGB")
+        model_inputs = IMG_PROCESSOR(images=pil_image, text=text_query, return_tensors="pt").to(device)
 
-    elif task_prompt in ['Referring Expression Segmentation', 'Region to Segmentation']:
-        tag = '<REFERRING_EXPRESSION_SEGMENTATION>' if task_prompt == 'Referring Expression Segmentation' else '<REGION_TO_SEGMENTATION>'
-        results = run_example(tag, image, text_input)
-        output_image = copy.deepcopy(image)
-        output_image = draw_polygons(output_image, results[tag], fill_mask=True)
-        return results, output_image
+        with torch.no_grad():
+            inference_output = IMG_MODEL(**model_inputs)
 
-    elif task_prompt == 'Open Vocabulary Detection':
-        results = run_example('<OPEN_VOCABULARY_DETECTION>', image, text_input)
-        bbox_results = convert_to_od_format(results['<OPEN_VOCABULARY_DETECTION>'])
-        img_out = plot_bbox(image, bbox_results)
-        return results, img_out
+        processed_results = IMG_PROCESSOR.post_process_instance_segmentation(
+            inference_output,
+            threshold=conf_thresh,
+            mask_threshold=0.5,
+            target_sizes=model_inputs.get("original_sizes").tolist()
+        )[0]
 
-    elif task_prompt == 'OCR with Region':
-        results = run_example('<OCR_WITH_REGION>', image)
-        output_image = copy.deepcopy(image)
-        output_image = draw_ocr_bboxes(output_image, results['<OCR_WITH_REGION>'])
-        return results, output_image
+        annotation_list = []
+        raw_masks = processed_results['masks'].cpu().numpy()
+        raw_scores = processed_results['scores'].cpu().numpy()
+        
+        for idx, mask_array in enumerate(raw_masks):
+            label_str = f"{text_query} ({raw_scores[idx]:.2f})"
+            annotation_list.append((mask_array, label_str))
+            
+        return (pil_image, annotation_list)
 
-    return "", None
+    except Exception as e:
+        raise gr.Error(f"Error during image processing: {e}")
 
-# --- UI Setup ---
-single_task_list = [
-    'Caption', 'Detailed Caption', 'More Detailed Caption', 'Object Detection',
-    'Dense Region Caption', 'Region Proposal', 'Caption to Phrase Grounding',
-    'Referring Expression Segmentation', 'Region to Segmentation',
-    'Open Vocabulary Detection', 'Open Vocabulary Detection + Segmentation',
-    'Region to Category', 'Region to Description', 'OCR', 'OCR with Region'
-]
+def run_image_click_gpu(input_image, x, y, points_state, labels_state):
+    if TRK_MODEL is None or TRK_PROCESSOR is None:
+        raise gr.Error("Tracker Model failed to load.")
+    
+    if input_image is None: return input_image, [], []
+    if points_state is None: points_state = []; labels_state = []
+    
+    # Append new point
+    points_state.append([x, y])
+    labels_state.append(1) # 1 indicates a positive click (foreground)
 
-cascased_task_list = [
-    'Caption + Grounding', 'Detailed Caption + Grounding', 'More Detailed Caption + Grounding',
-    'Open Vocabulary Detection + Segmentation'
-]
+    try:
+        # Prepare inputs format: [Batch, Point_Group, Point_Idx, Coord]
+        input_points = [[points_state]] 
+        input_labels = [[labels_state]]
+        
+        inputs = TRK_PROCESSOR(images=input_image, input_points=input_points, input_labels=input_labels, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            # multimask_output=True usually helps with ambiguity, but let's default to best mask for simplicity here
+            outputs = TRK_MODEL(**inputs, multimask_output=False)
+            
+        # Post process
+        masks = TRK_PROCESSOR.post_process_masks(outputs.pred_masks.cpu(), inputs["original_sizes"], binarize=True)[0]
+        
+        # Overlay mask
+        # masks shape is [1, 1, H, W] for single object tracking
+        final_img = apply_mask_overlay(input_image, masks[0])
+        
+        # Draw the visual points on top
+        final_img = draw_points_on_image(final_img, points_state)
+        
+        return final_img, points_state, labels_state
 
-def update_task_dropdown(choice):
-    return gr.Dropdown(choices=cascased_task_list, value='Caption + Grounding') if choice == 'Cascased task' else gr.Dropdown(choices=single_task_list, value='Caption')
+    except Exception as e:
+        print(f"Tracker Error: {e}")
+        return input_image, points_state, labels_state
+
+def image_click_handler(image, evt: gr.SelectData, points_state, labels_state):
+    # Wrapper to handle the Gradio select event
+    x, y = evt.index
+    return run_image_click_gpu(image, x, y, points_state, labels_state)
+
+def calc_timeout_duration(vid_file, *args):
+    return args[-1] if args else 60
+
+custom_css="""
+#col-container { margin: 0 auto; max-width: 1200px; }
+#main-title h1 { font-size: 2.2em !important; }
+"""
 
 with gr.Blocks() as demo:
-    with gr.Row():
-        with gr.Column():
-            input_img = gr.Image(label="Input Picture")
-            task_type = gr.Radio(choices=['Single task', 'Cascased task'], label='Task type selector', value='Cascased task')
-            task_prompt = gr.Dropdown(choices=cascased_task_list, label="Task Prompt", value="Open Vocabulary Detection + Segmentation")
-            task_type.change(fn=update_task_dropdown, inputs=task_type, outputs=task_prompt)
-            text_input = gr.Textbox(label="Text Input (e.g. 'car' or 'dog, cat')")
-            submit_btn = gr.Button(value="Submit")
-        with gr.Column():
-            output_text = gr.Textbox(label="Output Text")
-            output_img = gr.Image(label="Output Image")
+    with gr.Column(elem_id="col-container"):
+        with gr.Tabs():
+            with gr.Tab("Image Segmentation"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        image_input = gr.Image(label="Upload Image", type="pil", height=350)
+                        txt_prompt_img = gr.Textbox(label="Text Prompt", placeholder="e.g., cat, face, car wheel")
+                        with gr.Accordion("Advanced Settings", open=False):
+                            conf_slider = gr.Slider(0.0, 1.0, value=0.45, step=0.05, label="Confidence Threshold")
+                        
+                        btn_process_img = gr.Button("Segment Image", variant="primary")
 
-    submit_btn.click(process_image, [input_img, task_prompt, text_input], [output_text, output_img])
+                    with gr.Column(scale=1.5):
+                        image_result = gr.AnnotatedImage(label="Segmented Result", height=410)
+        
+                        btn_process_img.click(
+                            fn=run_image_segmentation, 
+                            inputs=[image_input, txt_prompt_img, conf_slider], 
+                            outputs=[image_result]
+                        )
+   
+            with gr.Tab("Image Click Segmentation"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        img_click_input = gr.Image(type="pil", label="Upload Image", interactive=True, height=450)
+                        
+                        with gr.Row():
+                            img_click_clear = gr.Button("Clear Points & Reset", variant="primary")
+                        
+                        st_click_points = gr.State([])
+                        st_click_labels = gr.State([])
 
-demo.launch(debug=True)
+                    with gr.Column(scale=1):
+                        img_click_output = gr.Image(type="pil", label="Result Preview", height=450, interactive=False)
+                
+                img_click_input.select(
+                    image_click_handler,
+                    inputs=[img_click_input, st_click_points, st_click_labels],
+                    outputs=[img_click_output, st_click_points, st_click_labels]
+                )
+                
+                img_click_clear.click(
+                    lambda: (None, [], []),
+                    outputs=[img_click_output, st_click_points, st_click_labels]
+                )
+
+if __name__ == "__main__":
+    demo.launch(css=custom_css, theme=gr.themes.Citrus(), ssr_mode=False, mcp_server=True, show_error=True)
