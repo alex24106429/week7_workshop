@@ -53,9 +53,6 @@ processors = {
     'microsoft/Florence-2-large': AutoProcessor.from_pretrained('microsoft/Florence-2-large', attn_implementation="sdpa", revision="00d2f1570b00c6dea5df998f5635db96840436bc", trust_remote_code=True),
 }
 
-
-DESCRIPTION = "# [Florence-2 Demo](https://huggingface.co/microsoft/Florence-2-large)"
-
 colormap = ['blue','orange','green','purple','brown','pink','gray','olive','cyan','red',
             'lime','indigo','violet','aqua','magenta','coral','gold','tan','skyblue']
 
@@ -271,30 +268,20 @@ def update_task_dropdown(choice):
     else:
         return gr.Dropdown(choices=single_task_list, value='Caption')
 
-
-
-# gokaygokay-ui-citation
-CITATION_MARKDOWN = 'This hosted interface is maintained by [Gökay Aydoğan](https://orcid.org/0000-0002-2343-9433). If you reference this repository in academic work, please cite it as follows and also cite the upstream models, datasets, or projects it builds upon.\n\n```bibtex\n@software{aydogan2024florence_2,\n  author = {Aydoğan, Gökay},\n  title = {{Florence-2}},\n  year = {2024},\n  publisher = {Hugging Face},\n  url = {https://huggingface.co/spaces/gokaygokay/Florence-2},\n  note = {Hosted interface; cite the upstream models and projects used by this Space as required.}\n}\n```'
-
 with gr.Blocks(css=css) as demo:
-    with gr.Accordion("Citation & attribution", open=False):
-        gr.Markdown(CITATION_MARKDOWN)
+    with gr.Row():
+        with gr.Column():
+            input_img = gr.Image(label="Input Picture")
+            model_selector = gr.Dropdown(choices=list(models.keys()), label="Model", value='microsoft/Florence-2-large')
+            task_type = gr.Radio(choices=['Single task', 'Cascased task'], label='Task type selector', value='Single task')
+            task_prompt = gr.Dropdown(choices=single_task_list, label="Task Prompt", value="Caption")
+            task_type.change(fn=update_task_dropdown, inputs=task_type, outputs=task_prompt)
+            text_input = gr.Textbox(label="Text Input (optional)")
+            submit_btn = gr.Button(value="Submit")
+        with gr.Column():
+            output_text = gr.Textbox(label="Output Text")
+            output_img = gr.Image(label="Output Image")
 
-    gr.Markdown(DESCRIPTION)
-    with gr.Tab(label="Florence-2 Image Captioning"):
-        with gr.Row():
-            with gr.Column():
-                input_img = gr.Image(label="Input Picture")
-                model_selector = gr.Dropdown(choices=list(models.keys()), label="Model", value='microsoft/Florence-2-large')
-                task_type = gr.Radio(choices=['Single task', 'Cascased task'], label='Task type selector', value='Single task')
-                task_prompt = gr.Dropdown(choices=single_task_list, label="Task Prompt", value="Caption")
-                task_type.change(fn=update_task_dropdown, inputs=task_type, outputs=task_prompt)
-                text_input = gr.Textbox(label="Text Input (optional)")
-                submit_btn = gr.Button(value="Submit")
-            with gr.Column():
-                output_text = gr.Textbox(label="Output Text")
-                output_img = gr.Image(label="Output Image")
-
-        submit_btn.click(process_image, [input_img, task_prompt, text_input, model_selector], [output_text, output_img])
+    submit_btn.click(process_image, [input_img, task_prompt, text_input, model_selector], [output_text, output_img])
 
 demo.launch(debug=True)
