@@ -38,8 +38,6 @@ except Exception as e:
     IMG_PROCESSOR = None
     TRK_MODEL = None
     TRK_PROCESSOR = None
-    VID_MODEL = None
-    VID_PROCESSOR = None
 
 
 # --- UTILS ---
@@ -178,9 +176,6 @@ def image_click_handler(image, evt: gr.SelectData, points_state, labels_state):
     # Wrapper to handle the Gradio select event
     x, y = evt.index
     return run_image_click_gpu(image, x, y, points_state, labels_state)
-
-def calc_timeout_duration(vid_file, *args):
-    return args[-1] if args else 60
 
 custom_css="""
 #col-container { margin: 0 auto; max-width: 1200px; }
