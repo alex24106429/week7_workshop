@@ -35,7 +35,6 @@ import random
 import numpy as np
 
 # --- Device & Dtype Setup ---
-# Checks for Intel Arc GPU via PyTorch XPU, otherwise uses CPU with bfloat16
 if hasattr(torch, "xpu") and torch.xpu.is_available():
     device = torch.device("xpu")
     dtype = torch.float16
@@ -44,7 +43,6 @@ elif torch.cuda.is_available():
     dtype = torch.float16
 else:
     device = torch.device("cpu")
-    # bfloat16 is heavily accelerated on Intel Core Ultra CPUs
     dtype = torch.bfloat16
 
 print(f"Running inference on: {device} with dtype: {dtype}")
@@ -73,7 +71,6 @@ def run_example(task_prompt, image, text_input=None):
     prompt = task_prompt if text_input is None else task_prompt + text_input
     inputs = processor(text=prompt, images=image, return_tensors="pt")
     
-    # Send inputs to device and appropriate precision
     inputs = {
         k: v.to(device=device, dtype=dtype) if v.is_floating_point() else v.to(device=device)
         for k, v in inputs.items()
@@ -86,7 +83,7 @@ def run_example(task_prompt, image, text_input=None):
             max_new_tokens=1024,
             early_stopping=False,
             do_sample=False,
-            num_beams=1,  # 1 instead of 3 reduces computation by ~3x
+            num_beams=1,
         )
 
     generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
@@ -97,7 +94,26 @@ def run_example(task_prompt, image, text_input=None):
     )
     return parsed_answer
 
-# Direct PIL drawing: Replaces slow Matplotlib subplots and removes memory leaks
+# Converts pixel bbox to Florence-2 <loc_x1><loc_y1><loc_x2><loc_y2> tokens
+def bbox_to_loc_tokens(bbox, width, height):
+    x1, y1, x2, y2 = bbox
+    xmin, xmax = min(x1, x2), max(x1, x2)
+    ymin, ymax = min(y1, y2), max(y1, y2)
+    
+    # Florence-2 uses 1000 coordinate bins [0, 999]
+    loc_x1 = int(np.clip(np.floor(xmin * 1000.0 / width), 0, 999))
+    loc_y1 = int(np.clip(np.floor(ymin * 1000.0 / height), 0, 999))
+    loc_x2 = int(np.clip(np.floor(xmax * 1000.0 / width), 0, 999))
+    loc_y2 = int(np.clip(np.floor(ymax * 1000.0 / height), 0, 999))
+    
+    # Avoid degenerate zero-area bounding boxes
+    if loc_x2 <= loc_x1:
+        loc_x2 = min(loc_x1 + 1, 999)
+    if loc_y2 <= loc_y1:
+        loc_y2 = min(loc_y1 + 1, 999)
+        
+    return f"<loc_{loc_x1}><loc_{loc_y1}><loc_{loc_x2}><loc_{loc_y2}>"
+
 def plot_bbox(image, data):
     output_image = image.copy()
     draw = ImageDraw.Draw(output_image)
@@ -110,7 +126,7 @@ def plot_bbox(image, data):
 def draw_polygons(image, prediction, fill_mask=False):
     draw = ImageDraw.Draw(image)
     scale = 1
-    for polygons, label in zip(prediction['polygons'], prediction['labels']):
+    for polygons, label in zip(prediction.get('polygons', []), prediction.get('labels', [])):
         color = random.choice(colormap)
         fill_color = color if fill_mask else None
         for _polygon in polygons:
@@ -122,13 +138,13 @@ def draw_polygons(image, prediction, fill_mask=False):
                 draw.polygon(_polygon, outline=color, fill=fill_color)
             else:
                 draw.polygon(_polygon, outline=color)
-            draw.text((_polygon[0] + 8, _polygon[1] + 2), label, fill=color)
+            draw.text((_polygon[0] + 8, _polygon[1] + 2), str(label), fill=color)
     return image
 
 def convert_to_od_format(data):
     return {
         'bboxes': data.get('bboxes', []),
-        'labels': data.get('bboxes_labels', [])
+        'labels': data.get('bboxes_labels', data.get('labels', []))
     }
 
 def draw_ocr_bboxes(image, prediction):
@@ -140,6 +156,58 @@ def draw_ocr_bboxes(image, prediction):
         draw.polygon(new_box, width=3, outline=color)
         draw.text((new_box[0] + 8, new_box[1] + 2), str(label), fill=color)
     return image
+
+# --- Cascaded Multi-Object Segmentation ---
+def run_ovd_to_segmentation(image, text_input=None):
+    if not text_input or not text_input.strip():
+        # Fallback to standard object detection if no text input provided
+        detection_task = '<OD>'
+        det_results = run_example(detection_task, image)
+        bboxes = det_results[detection_task].get('bboxes', [])
+        labels = det_results[detection_task].get('labels', [])
+    else:
+        detection_task = '<OPEN_VOCABULARY_DETECTION>'
+        det_results = run_example(detection_task, image, text_input)
+        det_data = det_results.get(detection_task, {})
+        bboxes = det_data.get('bboxes', [])
+        labels = det_data.get('bboxes_labels', det_data.get('labels', []))
+
+    if not bboxes:
+        return {"message": "No objects detected"}, image
+
+    if len(labels) < len(bboxes):
+        labels += [text_input if text_input else "object"] * (len(bboxes) - len(labels))
+
+    all_polygons = []
+    all_labels = []
+
+    # Segment every detected bounding box individually
+    for bbox, label in zip(bboxes, labels):
+        loc_tokens = bbox_to_loc_tokens(bbox, image.width, image.height)
+        seg_res = run_example('<REGION_TO_SEGMENTATION>', image, loc_tokens)
+        seg_data = seg_res.get('<REGION_TO_SEGMENTATION>', {})
+        polygons = seg_data.get('polygons', [])
+        
+        for poly in polygons:
+            all_polygons.append(poly)
+            all_labels.append(label)
+
+    combined_results = {
+        'detections': {
+            'bboxes': bboxes,
+            'labels': labels
+        },
+        '<REGION_TO_SEGMENTATION>': {
+            'polygons': all_polygons,
+            'labels': all_labels
+        }
+    }
+
+    output_image = copy.deepcopy(image)
+    if all_polygons:
+        output_image = draw_polygons(output_image, combined_results['<REGION_TO_SEGMENTATION>'], fill_mask=True)
+
+    return combined_results, output_image
 
 def process_image(image, task_prompt, text_input=None):
     image = Image.fromarray(image)
@@ -182,6 +250,10 @@ def process_image(image, task_prompt, text_input=None):
         img_out = plot_bbox(image, results[tag])
         return results, img_out
 
+    # Cascaded multi-object segmentation
+    elif task_prompt in ['Open Vocabulary Detection + Segmentation']:
+        return run_ovd_to_segmentation(image, text_input)
+
     elif task_prompt in ['Referring Expression Segmentation', 'Region to Segmentation']:
         tag = '<REFERRING_EXPRESSION_SEGMENTATION>' if task_prompt == 'Referring Expression Segmentation' else '<REGION_TO_SEGMENTATION>'
         results = run_example(tag, image, text_input)
@@ -208,12 +280,13 @@ single_task_list = [
     'Caption', 'Detailed Caption', 'More Detailed Caption', 'Object Detection',
     'Dense Region Caption', 'Region Proposal', 'Caption to Phrase Grounding',
     'Referring Expression Segmentation', 'Region to Segmentation',
-    'Open Vocabulary Detection', 'Region to Category', 'Region to Description',
-    'OCR', 'OCR with Region'
+    'Open Vocabulary Detection', 'Open Vocabulary Detection + Segmentation',
+    'Region to Category', 'Region to Description', 'OCR', 'OCR with Region'
 ]
 
 cascased_task_list = [
-    'Caption + Grounding', 'Detailed Caption + Grounding', 'More Detailed Caption + Grounding'
+    'Caption + Grounding', 'Detailed Caption + Grounding', 'More Detailed Caption + Grounding',
+    'Open Vocabulary Detection + Segmentation'
 ]
 
 def update_task_dropdown(choice):
@@ -223,10 +296,10 @@ with gr.Blocks() as demo:
     with gr.Row():
         with gr.Column():
             input_img = gr.Image(label="Input Picture")
-            task_type = gr.Radio(choices=['Single task', 'Cascased task'], label='Task type selector', value='Single task')
-            task_prompt = gr.Dropdown(choices=single_task_list, label="Task Prompt", value="Caption")
+            task_type = gr.Radio(choices=['Single task', 'Cascased task'], label='Task type selector', value='Cascased task')
+            task_prompt = gr.Dropdown(choices=cascased_task_list, label="Task Prompt", value="Open Vocabulary Detection + Segmentation")
             task_type.change(fn=update_task_dropdown, inputs=task_type, outputs=task_prompt)
-            text_input = gr.Textbox(label="Text Input (optional)")
+            text_input = gr.Textbox(label="Text Input (e.g. 'car' or 'dog, cat')")
             submit_btn = gr.Button(value="Submit")
         with gr.Column():
             output_text = gr.Textbox(label="Output Text")
