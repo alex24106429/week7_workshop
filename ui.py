@@ -45,13 +45,22 @@ import matplotlib.patches as patches
 import random
 import numpy as np
 
-models = {
-    'microsoft/Florence-2-large': AutoModelForCausalLM.from_pretrained('microsoft/Florence-2-large', trust_remote_code=True, attn_implementation="sdpa", revision="00d2f1570b00c6dea5df998f5635db96840436bc" ).eval(),
-}
+MODEL_ID = 'microsoft/Florence-2-large'
+REVISION = '00d2f1570b00c6dea5df998f5635db96840436bc'
 
-processors = {
-    'microsoft/Florence-2-large': AutoProcessor.from_pretrained('microsoft/Florence-2-large', attn_implementation="sdpa", revision="00d2f1570b00c6dea5df998f5635db96840436bc", trust_remote_code=True),
-}
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    trust_remote_code=True,
+    attn_implementation="sdpa",
+    revision=REVISION
+).eval()
+
+processor = AutoProcessor.from_pretrained(
+    MODEL_ID,
+    attn_implementation="sdpa",
+    revision=REVISION,
+    trust_remote_code=True
+)
 
 colormap = ['blue','orange','green','purple','brown','pink','gray','olive','cyan','red',
             'lime','indigo','violet','aqua','magenta','coral','gold','tan','skyblue']
@@ -62,9 +71,7 @@ def fig_to_pil(fig):
     buf.seek(0)
     return Image.open(buf)
 
-def run_example(task_prompt, image, text_input=None, model_id='microsoft/Florence-2-large'):
-    model = models[model_id]
-    processor = processors[model_id]
+def run_example(task_prompt, image, text_input=None):
     if text_input is None:
         prompt = task_prompt
     else:
@@ -98,7 +105,6 @@ def plot_bbox(image, data):
     return fig
 
 def draw_polygons(image, prediction, fill_mask=False):
-
     draw = ImageDraw.Draw(image)
     scale = 1
     for polygons, label in zip(prediction['polygons'], prediction['labels']):
@@ -140,105 +146,105 @@ def draw_ocr_bboxes(image, prediction):
                   fill=color)
     return image
 
-def process_image(image, task_prompt, text_input=None, model_id='microsoft/Florence-2-large'):
+def process_image(image, task_prompt, text_input=None):
     image = Image.fromarray(image)  # Convert NumPy array to PIL Image
     if task_prompt == 'Caption':
         task_prompt = '<CAPTION>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         return results, None
     elif task_prompt == 'Detailed Caption':
         task_prompt = '<DETAILED_CAPTION>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         return results, None
     elif task_prompt == 'More Detailed Caption':
         task_prompt = '<MORE_DETAILED_CAPTION>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         return results, None
     elif task_prompt == 'Caption + Grounding':
         task_prompt = '<CAPTION>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         text_input = results[task_prompt]
         task_prompt = '<CAPTION_TO_PHRASE_GROUNDING>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         results['<CAPTION>'] = text_input
         fig = plot_bbox(image, results['<CAPTION_TO_PHRASE_GROUNDING>'])
         return results, fig_to_pil(fig)
     elif task_prompt == 'Detailed Caption + Grounding':
         task_prompt = '<DETAILED_CAPTION>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         text_input = results[task_prompt]
         task_prompt = '<CAPTION_TO_PHRASE_GROUNDING>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         results['<DETAILED_CAPTION>'] = text_input
         fig = plot_bbox(image, results['<CAPTION_TO_PHRASE_GROUNDING>'])
         return results, fig_to_pil(fig)
     elif task_prompt == 'More Detailed Caption + Grounding':
         task_prompt = '<MORE_DETAILED_CAPTION>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         text_input = results[task_prompt]
         task_prompt = '<CAPTION_TO_PHRASE_GROUNDING>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         results['<MORE_DETAILED_CAPTION>'] = text_input
         fig = plot_bbox(image, results['<CAPTION_TO_PHRASE_GROUNDING>'])
         return results, fig_to_pil(fig)
     elif task_prompt == 'Object Detection':
         task_prompt = '<OD>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         fig = plot_bbox(image, results['<OD>'])
         return results, fig_to_pil(fig)
     elif task_prompt == 'Dense Region Caption':
         task_prompt = '<DENSE_REGION_CAPTION>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         fig = plot_bbox(image, results['<DENSE_REGION_CAPTION>'])
         return results, fig_to_pil(fig)
     elif task_prompt == 'Region Proposal':
         task_prompt = '<REGION_PROPOSAL>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         fig = plot_bbox(image, results['<REGION_PROPOSAL>'])
         return results, fig_to_pil(fig)
     elif task_prompt == 'Caption to Phrase Grounding':
         task_prompt = '<CAPTION_TO_PHRASE_GROUNDING>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         fig = plot_bbox(image, results['<CAPTION_TO_PHRASE_GROUNDING>'])
         return results, fig_to_pil(fig)
     elif task_prompt == 'Referring Expression Segmentation':
         task_prompt = '<REFERRING_EXPRESSION_SEGMENTATION>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         output_image = copy.deepcopy(image)
         output_image = draw_polygons(output_image, results['<REFERRING_EXPRESSION_SEGMENTATION>'], fill_mask=True)
         return results, output_image
     elif task_prompt == 'Region to Segmentation':
         task_prompt = '<REGION_TO_SEGMENTATION>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         output_image = copy.deepcopy(image)
         output_image = draw_polygons(output_image, results['<REGION_TO_SEGMENTATION>'], fill_mask=True)
         return results, output_image
     elif task_prompt == 'Open Vocabulary Detection':
         task_prompt = '<OPEN_VOCABULARY_DETECTION>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         bbox_results = convert_to_od_format(results['<OPEN_VOCABULARY_DETECTION>'])
         fig = plot_bbox(image, bbox_results)
         return results, fig_to_pil(fig)
     elif task_prompt == 'Region to Category':
         task_prompt = '<REGION_TO_CATEGORY>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         return results, None
     elif task_prompt == 'Region to Description':
         task_prompt = '<REGION_TO_DESCRIPTION>'
-        results = run_example(task_prompt, image, text_input, model_id)
+        results = run_example(task_prompt, image, text_input)
         return results, None
     elif task_prompt == 'OCR':
         task_prompt = '<OCR>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         return results, None
     elif task_prompt == 'OCR with Region':
         task_prompt = '<OCR_WITH_REGION>'
-        results = run_example(task_prompt, image, model_id=model_id)
+        results = run_example(task_prompt, image)
         output_image = copy.deepcopy(image)
         output_image = draw_ocr_bboxes(output_image, results['<OCR_WITH_REGION>'])
         return results, output_image
     else:
-        return "", None  # Return empty string and None for unknown task prompts
+        return "", None
 
 css = """
   #output {
@@ -248,8 +254,7 @@ css = """
   }
 """
 
-
-single_task_list =[
+single_task_list = [
     'Caption', 'Detailed Caption', 'More Detailed Caption', 'Object Detection',
     'Dense Region Caption', 'Region Proposal', 'Caption to Phrase Grounding',
     'Referring Expression Segmentation', 'Region to Segmentation',
@@ -257,10 +262,9 @@ single_task_list =[
     'OCR', 'OCR with Region'
 ]
 
-cascased_task_list =[
+cascased_task_list = [
     'Caption + Grounding', 'Detailed Caption + Grounding', 'More Detailed Caption + Grounding'
 ]
-
 
 def update_task_dropdown(choice):
     if choice == 'Cascased task':
@@ -272,7 +276,6 @@ with gr.Blocks(css=css) as demo:
     with gr.Row():
         with gr.Column():
             input_img = gr.Image(label="Input Picture")
-            model_selector = gr.Dropdown(choices=list(models.keys()), label="Model", value='microsoft/Florence-2-large')
             task_type = gr.Radio(choices=['Single task', 'Cascased task'], label='Task type selector', value='Single task')
             task_prompt = gr.Dropdown(choices=single_task_list, label="Task Prompt", value="Caption")
             task_type.change(fn=update_task_dropdown, inputs=task_type, outputs=task_prompt)
@@ -282,6 +285,6 @@ with gr.Blocks(css=css) as demo:
             output_text = gr.Textbox(label="Output Text")
             output_img = gr.Image(label="Output Image")
 
-    submit_btn.click(process_image, [input_img, task_prompt, text_input, model_selector], [output_text, output_img])
+    submit_btn.click(process_image, [input_img, task_prompt, text_input], [output_text, output_img])
 
 demo.launch(debug=True)
